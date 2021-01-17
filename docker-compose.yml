@@ -3,7 +3,7 @@ services:
 
   homeassistant:
     container_name: ha-ha
-    build: .
+    build: ./app
     image: homaha
     networks:
        hanet:
