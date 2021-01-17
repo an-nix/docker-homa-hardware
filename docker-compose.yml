@@ -4,7 +4,16 @@ services:
   homeassistant:
     container_name: ha-ha
     build: ./app
-    image: homaha
+    image: mebaxyz/homaha
+    environment:
+      - MQTT_HOSTNAME=homa
+      - MQTT_PORT=1883
+      - OFFSET_PRESSURE=0
+      - OFFSET_TEMPERATURE=0
+      - OFFSET_HUMIDITY=0
+      - OFFSET_ILLUMINANCE=0
+      - ALTITUDE=475
+      - ROUND=3
     networks:
        hanet:
     privileged: true

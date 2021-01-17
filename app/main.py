@@ -3,6 +3,8 @@ import bme280
 import bme280.const as oversampling
 import time
 import json
+import os
+import logging
 
 
 from threading import Thread
@@ -39,9 +41,11 @@ def getserial():
   return cpuserial
 
 class MqttSensorBH1750:
-    def __init__(self,address):
+    def __init__(self,address,illuminance_offset=0.0, round = 2):
         self.__bus = smbus2.SMBus(1)
         self.__address = address
+        self.__illuminance_offset = illuminance_offset
+        self.__round = round
 
     def convertToNumber(self,data):
         # Simple function to convert 2 bytes of data
@@ -52,8 +56,8 @@ class MqttSensorBH1750:
 
     def read(self):
         # Read data from I2C interface
-        self.__data = self.__bus.read_i2c_block_data(self.__address,ONE_TIME_HIGH_RES_MODE_1,16)
-        __dict = {"illuminance":round(self.convertToNumber(self.__data),2)}
+        self.__data = self.__bus.read_i2c_block_data(self.__address,ONE_TIME_HIGH_RES_MODE_1,2)
+        __dict = {"illuminance":round(self.convertToNumber(self.__data) + self.__illuminance_offset,self.__round)}
         #self.payload = json.dumps(__dict)
         self.payload = __dict
         
@@ -78,21 +82,30 @@ class MqttSensorBH1750:
 
 class MqttSensorBME280:
 
-    def __init__(self,address):
+    def __init__(self,address, temperature_offset=0.0, pressure_offset=0.0, humidity_offset=0.0, altitude=0.0, round = 2):
         self.__bus = smbus2.SMBus(1)
         self.__address = address
         self.__calibration_params = bme280.load_calibration_params(self.__bus, self.__address)
+        self.__temperature_offset = temperature_offset
+        self.__pressure_offset = pressure_offset
+        self.__humidity_offset = humidity_offset
+        self.__altitude = altitude
+        self.__round = round
         
         pass
+
+    def normalize_pressure(self, raw_pressure):
+        
+        np = raw_pressure*(1 - (0.0065*self.__altitude / 288.15))**-5.255
+        return np
 
     def read(self):
         self.__data = bme280.sample(self.__bus, self.__address, self.__calibration_params,sampling=2)
         __dict = {
-            "temperature": round(self.__data.temperature,2),
-            "humidity": round(self.__data.humidity,2),
-            "pressure": round(self.__data.pressure,2) 
+            "temperature": round(self.__data.temperature + self.__temperature_offset,self.__round),
+            "humidity": round(self.__data.humidity + self.__humidity_offset,self.__round),
+            "pressure": round(self.normalize_pressure(self.__data.pressure + self.__pressure_offset),self.__round) 
         }
-        #self.payload = json.dumps(__dict)
         self.payload = __dict
 
     def config_payload(self,name,unique_id,state_topic):
@@ -147,8 +160,12 @@ class MqttSensors(Thread):
         self.__dicovery = False
         self.__unique_id = getserial()[8:]
         self.__temp = MqttSensorBME280(0x76)
-        self.__sensor = [MqttSensorBME280(0x76),MqttSensorBH1750(0x23)]
+        self.__sensor = []
     
+    def register_sensor(self,sensor):
+        self.__sensor.append(sensor)
+
+
     def release_autoconfig(self):
         if(self.__dicovery == True):
             self.discovery=False
@@ -162,19 +179,12 @@ class MqttSensors(Thread):
             ret = []
             
             for s in self.__sensor:
-                ret.extend(s.config_payload("onboard",self.__unique_id,"homeassistant/sensor/onboard/state"))
-            
-            print(ret)
+                ret.extend(s.config_payload("onboard",self.__unique_id,"homeassistant/sensor/onboard/state"))            
 
-            #ret = self.__temp.config_payload("onboard",self.__unique_id,"homeassistant/sensor/onboard/state")
             for i in ret:
-                print("Discovery Message:")
-                print(json.dumps(i))
-                #print("homeassistant/sensor/onboard{0}/config".format(i["device_class"]))
+                logging.info(f"Disovery message: {json.dumps(i)}") 
                 self.__mqtt_client.publish("homeassistant/sensor/onboard/{0}/config".format(i["device_class"]),json.dumps(i),retain=True)            
-                #self.__mqtt_client.publish("homeassistant/sensor/onboard/config",json.dumps(i))            
-                
-                #time.sleep(1)
+
             self.__dicovery = True
             self.start()
 
@@ -186,39 +196,104 @@ class MqttSensors(Thread):
                 s.read()
                 value.update(s.payload)
             self.__mqtt_client.publish("homeassistant/sensor/onboard/state",json.dumps(value))
-            time.sleep(30)
+            time.sleep(10)
 
 
 def on_disconnect(client, userdata,rc=0):
-    print("DisConnected result code "+str(rc))
+    logging.info("DisConnected result code "+str(rc))
     mh.release_autoconfig()
 
 # The callback for when the client receives a CONNACK response from the server.
 def on_connect(client, userdata, flags, rc):
-    print("Connected with result code "+str(rc))
-    client.subscribe("HoMa/*")
+    logging.info("Connected with result code "+str(rc))
     mh.auto_configuration() 
-
 
 # The callback for when a PUBLISH message is received from the server.
 def on_message(client, userdata, msg):
-    print(msg.topic+" "+str(msg.payload))
+    logging.info(msg.topic+" "+str(msg.payload))
 
 def main():
+    
+    logging.basicConfig(
+    format='%(asctime)s;%(levelname)s;%(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S')
     
     #Set Callback functions
     client.on_disconnect = on_disconnect
     client.on_connect = on_connect
     client.on_message = on_message
 
-    client.connect_async("homa",1883,10)
-    #client.connect_async("localhost",1883,10)
+
+    #MQTT HOSTNAME
+    if "MQTT_HOSTNAME" not in os.environ:
+        mqtt_hostname = "localhost"
+    else:
+        mqtt_hostname = os.environ["MQTT_HOSTNAME"]
+
+    #MQTT PORT
+    if "MQTT_PORT" not in os.environ:
+        mqtt_port = 1883
+    else:
+        mqtt_port = int(os.environ["MQTT_PORT"])
+
+    if "MQTT_KEEPALIVE" not in os.environ:
+        mqtt_keepalive = 60
+    else:
+        mqtt_keepalive = os.environ["MQTT_KEEPALIVE"]
+
+
+
+    if "OFFSET_PRESSURE" not in os.environ:
+        OFFSET_PRESSURE = 0
+    else:
+        OFFSET_PRESSURE = float(os.environ["OFFSET_PRESSURE"])
+
+    if "OFFSET_HUMIDITY" not in os.environ:
+        OFFSET_HUMIDITY = 0
+    else:
+        OFFSET_HUMIDITY = float(os.environ["OFFSET_HUMIDITY"])
+
+    if "OFFSET_TEMPERATURE" not in os.environ:
+        OFFSET_TEMPERATURE = 0
+    else:
+        OFFSET_TEMPERATURE = float(os.environ["OFFSET_TEMPERATURE"])
+
+    if "OFFSET_ILLUMINANCE" not in os.environ:
+        OFFSET_ILLUMINANCE = 0
+    else:
+        OFFSET_ILLUMINANCE = float(os.environ["OFFSET_ILLUMINANCE"])
+
+    if "ALTITUDE" not in os.environ:
+        ALTITUDE = 0
+    else:
+        ALTITUDE = float(os.environ["ALTITUDE"])
+    
+    if "ROUND" not in os.environ:
+        ROUND = 2
+    else:
+        ROUND = int(os.environ["ROUND"])
+
+    logging.info("Register BME280 Sensor")
+    mh.register_sensor(MqttSensorBME280(0x76,temperature_offset=OFFSET_TEMPERATURE,
+                                            pressure_offset=OFFSET_PRESSURE,
+                                            humidity_offset=OFFSET_HUMIDITY,
+                                            altitude=ALTITUDE,
+                                            round=ROUND))
+
+    logging.info("Register BH1750 Sensor")
+    mh.register_sensor(MqttSensorBH1750(0x23,illuminance_offset=OFFSET_ILLUMINANCE,round=ROUND))
+
+
+    logging.info(f"Connect to MQTT Broker {mqtt_hostname}:{mqtt_port}")
+
+    client.connect_async(mqtt_hostname,mqtt_port,mqtt_keepalive)
+
 
     client.loop_start()
     
     while(1):
         time.sleep(10)
-
 
 
 client = mqtt.Client()
